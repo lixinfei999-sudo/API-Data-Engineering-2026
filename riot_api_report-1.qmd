@@ -1,0 +1,706 @@
+---
+title: "Early-Game Predictors of League of Legends Match Outcomes"
+author: "Mia Li, Shiwei Zhang, Jiajun Yu"
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    number-sections: false
+    code-fold: true
+    code-tools: true
+    embed-resources: true
+execute:
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+library(tidyverse)
+library(httr2)
+library(jsonlite)
+library(purrr)
+library(tidymodels)
+library(scales)
+library(knitr)
+set.seed(123)
+
+theme_set(theme_minimal())
+
+data_path <- "lol_match_data.csv"
+```
+
+# Introduction
+
+In this project, we explore the impact of early-game performance metrics on the outcome of League of Legends (LoL) matches by accessing data from the Riot Games Developer API. Specifically, it aims to determine whether a 10-minute snapshot can reliably predict the winner. This project implements custom API calls to the MATCH-V5 and LEAGUE-V4 endpoints. We focus on “Ranked Solo/Duo” matches at high tiers (master) to ensure high-quality and consistency of every game data. By employing the tidymodels framework in the R language, we trained a binary classification model designed to make predictions based on early-game features.
+
+# Description of Data
+
+The data were collected from the Riot Games API and saved as a cleaned match-level dataset.
+This report uses the file lol_match_data.csv. Each row represents one Ranked Solo/Duo
+match. The final dataset used in this report contains 2630 rows and 2630 unique matches after
+duplicate matches and incomplete records were removed.
+
+The data collection process used Riot account, league, match, and timeline endpoints. The
+account and league endpoints were used to find high-ranked Korean solo queue players, while
+the match and timeline endpoints were used to collect match IDs, final winners, gold values,
+XP values, and dragon events. Matches with missing or unreliable timeline information, such
+as remakes, were skipped so the final analysis would be based on complete 10-minute data.
+
+The three target predictor variables are:
+
+- **Gold differential at 10 minutes:** blue-team gold minus red-team gold.
+- **XP differential at 10 minutes:** blue-team experience minus red-team experience.
+- **Blue dragon before 10 minutes:** whether the blue team secured an early dragon.
+
+Positive gold and XP values mean the blue team was ahead at 10 minutes. Negative values mean the red team was ahead.
+
+This question is important because League of Legends often has a "snowball effect." A team that gains an early advantage can use stronger items, and better objective control to increase its chance of winning. However, the game is not fully decided in the first 10 minutes. Teams can still make comebacks through team fights, Baron, scaling champions, or mistakes by the leading team.
+
+# API Data Collection Pipeline
+
+The data were collected using multiple Riot Games API endpoints. The overall pipeline was:
+
+**Master players → PUUIDs → recent 20 match IDs → timeline data → final dataset**
+
+We used:
+
+- **League-V4** to find Master-tier Ranked Solo/Duo players.
+- **Account-V1 / PUUID information** to identify players.
+- **Match-V5** to collect recent ranked match IDs.
+- **Timeline** to extract 10-minute gold, XP, and dragon events.
+
+The API responses came in **JSON**. In R, `httr2` was used to send API requests, and `jsonlite` was used to parse the JSON response into R objects.
+
+The API chunks below are shown as representative code. They are set to `eval: false` because running the API collection again would take a long time and messed up the data.
+
+```{r}
+#| eval: false
+
+library(tidyverse)
+library(httr2)
+library(jsonlite)
+library(purrr)
+
+api_key <- Sys.getenv("") # Not for public display
+```
+
+## Step 1: Get Master-tier players
+
+```{r}
+#| eval: false
+master_url <- "https://kr.api.riotgames.com/lol/league/v4/masterleagues/by-queue/RANKED_SOLO_5x5"
+
+resp_master <- request(master_url) %>%
+  req_headers("X-Riot-Token" = my_key) %>%
+  req_perform()
+
+master_data <- resp_master %>% resp_body_json()
+
+elite_summoner_ids <- master_data$entries %>%
+  map_chr("summonerId", .default = NA_character_) %>% 
+  na.omit() %>%       # Drop any accounts that returned NA
+  as.character() %>%  # Clean up the vector
+  head(10)            # Take the first 10 for our test batch
+
+print(paste("Grabbed", length(elite_summoner_ids), "Summoner IDs."))
+print(names(master_data$entries[[1]]))
+
+elite_puuids <- master_data$entries %>%
+  map_chr("puuid", .default = NA_character_) %>% 
+  na.omit() %>%
+  as.character() %>%
+  head(150) # Upgraded from 10 to 150 players
+
+print(paste("Grabbed", length(elite_puuids), "PUUIDs directly!"))
+
+message("Harvesting Match IDs for 150 players...")
+
+all_match_ids <- map(elite_puuids, ~get_matches_for_puuid(.x, my_key)) %>%
+  flatten_chr() %>%
+  unique() 
+
+print(paste("Successfully harvested", length(all_match_ids), "UNIQUE Match IDs!"))
+```
+
+This step collects PUUIDs from Master-tier players. PUUIDs are unique player identifiers used by Riot's match API. The `unique()` function removes duplicate match IDs so the same game is not counted twice.
+
+## Step 2: Collect recent ranked match IDs
+
+```{r}
+#| eval: false
+
+raw_url <- paste0("https://asia.api.riotgames.com/riot/account/v1/accounts/by-riot-id/", 
+                  game_name, "/", tag_line)
+encoded_url <- URLencode(raw_url)
+
+# Perform the request
+resp_account <- request(encoded_url) %>%
+  req_headers("X-Riot-Token" = api) %>%
+  req_retry(max_tries = 3) %>% 
+  req_perform()
+
+user_data <- resp_account %>% 
+  resp_body_json()
+
+user_puuid <- user_data$puuid
+print(paste("Your PUUID is:", user_puuid))
+
+region_cluster <- "asia" # since hide on bush is in Korea, asia
+
+match_list_url <- paste0("https://", region_cluster, 
+                         ".api.riotgames.com/lol/match/v5/matches/by-puuid/", 
+                         user_puuid, "/ids")
+
+resp_matches <- request(match_list_url) %>%
+  req_url_query(queue = 420, count = 20) %>%
+  req_headers("X-Riot-Token" = api) %>%
+  req_perform()
+
+match_ids <- resp_matches %>% 
+  resp_body_json()
+
+print(match_ids)
+```
+
+This step collects recent Ranked Solo/Duo match IDs. 
+
+## Step 3: Extract match-level features
+
+```{r}
+#| eval: false
+get_match_features <- function(match_id, api_key) {
+  
+  timeline_url <- paste0("https://asia.api.riotgames.com/lol/match/v5/matches/", 
+                         match_id, "/timeline")
+  
+  resp_timeline <- request(timeline_url) %>%
+    req_headers("X-Riot-Token" = api_key) %>%
+    req_retry(max_tries = 5) %>% 
+    req_perform() %>%
+    resp_body_json()
+  
+  # Extract Gold & XP at 10 minutes
+  ten_min_frame <- resp_timeline$info$frames[[11]]
+  
+  gold_values <- map_dbl(ten_min_frame$participantFrames, ~.x$totalGold)
+  gold_diff_10m <- sum(gold_values[1:5]) - sum(gold_values[6:10])
+  
+  xp_values <- map_dbl(ten_min_frame$participantFrames, ~.x$xp)
+  xp_diff_10m <- sum(xp_values[1:5]) - sum(xp_values[6:10])
+  
+  # Extract Objective Control
+  events_10m <- map(resp_timeline$info$frames[1:11], "events") %>%purrr::flatten()
+  
+  # Filter for only Dragon kills
+  dragon_kills <- keep(events_10m, ~ isTRUE(.x$type == "ELITE_MONSTER_KILL") && 
+                                   isTRUE(.x$monsterType == "DRAGON"))
+  
+  # dragon
+  blue_dragon_10m <- 0
+  if (length(dragon_kills) > 0) {
+    if (dragon_kills[[1]]$killerId %in% 1:5) {
+      blue_dragon_10m <- 1
+    }
+  }
+  
+  match_url <- paste0("https://asia.api.riotgames.com/lol/match/v5/matches/", match_id)
+  
+  resp_match <- request(match_url) %>%
+    req_headers("X-Riot-Token" = api_key) %>%
+    req_retry(max_tries = 5) %>%
+    req_perform() %>%
+    resp_body_json()
+  
+  blue_win <- resp_match$info$teams[[1]]$win
+  
+  return(tibble(
+    match_id = match_id,
+    gold_diff_10m = gold_diff_10m,
+    xp_diff_10m = xp_diff_10m,
+    blue_dragon_10m = blue_dragon_10m,
+    blue_win = blue_win
+  ))
+}
+```
+
+This function turns one match ID into one row of usable data. It extracts gold differential, XP differential, dragon control, and the final blue-team outcome.
+
+## Step 4: Build and save the dataset
+
+```{r}
+#| eval: false
+
+final_training_data <- map_df(all_match_ids, function(id) {
+  
+  message(paste("Processing match:", id))
+  
+  Sys.sleep(1.2) 
+  
+  # if a single match is corrupted or was a 3-minute remake.
+  tryCatch({
+    get_match_features(id, my_key)
+  }, error = function(e) {
+    message(paste("Skipped match", id, "due to error/remake."))
+    return(NULL)
+  })
+})
+
+write_csv(final_training_data, "lol_match_data.csv")
+print("SUCCESS: Data safely written to lol_match_data_final.csv!")
+```
+
+Matches with missing or unreliable timeline data, such as remakes, were skipped. This helps make sure the final analysis is based on complete 10-minute match data.
+
+# Exploratory Data Analysis
+
+```{r}
+
+data_candidates <- c(
+  "lol_match_data.csv"
+)
+
+data_file <- data_candidates[file.exists(data_candidates)][1]
+
+if (is.na(data_file)) {
+  stop("No League of Legends match data CSV file was found in this folder.")
+}
+
+raw_data <- read_csv(data_file, show_col_types = FALSE)
+
+if (!"blue_dragon_10m" %in% names(raw_data)) {
+  stop("The selected data file does not include blue_dragon_10m. Please use the new CSV with dragon data.")
+}
+
+riot_data <- raw_data %>%
+  distinct(match_id, .keep_all = TRUE) %>%
+  drop_na(gold_diff_10m, xp_diff_10m, blue_dragon_10m, blue_win) %>%
+  mutate(
+    blue_win_text = str_to_lower(as.character(blue_win)),
+    blue_win = case_when(
+      blue_win_text %in% c("true", "1", "win") ~ "Win",
+      blue_win_text %in% c("false", "0", "loss") ~ "Loss",
+      TRUE ~ NA_character_
+    ),
+    blue_win = factor(blue_win, levels = c("Loss", "Win")),
+    blue_win_num = if_else(blue_win == "Win", 1, 0),
+    blue_dragon_10m = case_when(
+      as.character(blue_dragon_10m) %in% c("1", "TRUE", "true", "Yes", "yes") ~ 1,
+      as.character(blue_dragon_10m) %in% c("0", "FALSE", "false", "No", "no") ~ 0,
+      TRUE ~ NA_real_
+    ),
+    blue_dragon_status = factor(
+      blue_dragon_10m,
+      levels = c(0, 1),
+      labels = c("No Early Dragon", "Secured Early Dragon")
+    )
+  ) %>%
+  drop_na(blue_win, blue_dragon_10m, blue_dragon_status) %>%
+  select(
+    match_id,
+    gold_diff_10m,
+    xp_diff_10m,
+    blue_dragon_10m,
+    blue_dragon_status,
+    blue_win,
+    blue_win_num
+  )
+glimpse(riot_data)
+```
+
+The cleaned dataset contains one row per match. The variables are organized so that the analysis compares early-game signals with the final blue-team outcome.
+
+## Match Outcome Counts
+
+```{r}
+#| label: table-match-counts
+
+outcome_counts <- riot_data |>
+  count(blue_win, name = "matches")
+
+kable(outcome_counts)
+```
+
+This table shows the number of blue-team wins and losses in the cleaned dataset.
+
+## Summary of Early-Game Features
+
+```{r}
+#| label: table-feature-summary
+eda_summary <- riot_data %>%
+  group_by(blue_win) %>%
+  summarize(
+    matches = n(),
+    mean_gold_diff_10m = round(mean(gold_diff_10m), 1),
+    median_gold_diff_10m = round(median(gold_diff_10m), 1),
+    mean_xp_diff_10m = round(mean(xp_diff_10m), 1),
+    median_xp_diff_10m = round(median(xp_diff_10m), 1),
+    early_dragon_rate = percent(mean(blue_dragon_10m == 1), accuracy = 0.1),
+    .groups = "drop"
+  )
+
+eda_summary %>%
+  knitr::kable(caption = "Early-game feature summary by match outcome.")
+```
+
+The summary table compares the early-game variables between blue-team wins and blue-team losses. If the predictors are meaningful, winning games should generally have higher gold and XP differentials.
+
+## Gold Differential at 10 Minutes
+
+```{r gold-diff-plot, message=FALSE, warning=FALSE, fig.width=8, fig.height=5}
+gold_labels <- riot_data %>%
+  group_by(blue_win) %>%
+  summarize(
+    median_gold = median(gold_diff_10m),
+    matches = n(),
+    .groups = "drop"
+  )
+
+riot_data %>%
+  ggplot(aes(x = blue_win, y = gold_diff_10m, fill = blue_win)) +
+  geom_violin(alpha = 0.25, trim = FALSE, color = NA) +
+  geom_boxplot(width = 0.18, alpha = 0.85, outlier.alpha = 0.15) +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.8) +
+  stat_summary(fun = median, geom = "point", shape = 23, size = 3.5, fill = "white") +
+  geom_text(
+    data = gold_labels,
+    aes(
+      x = blue_win,
+      y = median_gold,
+      label = paste0("Median: ", comma(round(median_gold)), "\n", "n = ", matches)
+    ),
+    vjust = -1,
+    fontface = "bold",
+    size = 3.5,
+    inherit.aes = FALSE
+  ) +
+  labs(
+    title = "Gold Differential at 10 Minutes vs. Match Outcome",
+    x = "Final Match Outcome for Blue Team",
+    y = "Blue Team Gold Differential at 10 Minutes",
+    fill = "Outcome"
+  ) +
+  theme(legend.position = "none")
+```
+
+The plot shows that blue-team wins are associated with higher gold differential at 10 minutes. The dashed line marks an even game state. The median labels make the difference between wins and losses easier to compare.
+
+## Experience Differential at 10 Minutes
+
+```{r, fig.width=8, fig.height=5}
+xp_labels <- riot_data %>%
+  group_by(blue_win) %>%
+  summarize(
+    median_xp = median(xp_diff_10m),
+    matches = n(),
+    .groups = "drop"
+  )
+
+riot_data %>%
+  ggplot(aes(x = blue_win, y = xp_diff_10m, fill = blue_win)) +
+  geom_violin(alpha = 0.25, trim = FALSE, color = NA) +
+  geom_boxplot(width = 0.18, alpha = 0.85, outlier.alpha = 0.15) +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.8) +
+  stat_summary(fun = median, geom = "point", shape = 23, size = 3.5, fill = "white") +
+  geom_text(
+    data = xp_labels,
+    aes(
+      x = blue_win,
+      y = median_xp,
+      label = paste0("Median: ", comma(round(median_xp)), "\n", "n = ", matches)
+    ),
+    vjust = -1,
+    fontface = "bold",
+    size = 3.5,
+    inherit.aes = FALSE
+  ) +
+  labs(
+    title = "Experience Differential at 10 Minutes vs. Match Outcome",
+    x = "Final Match Outcome for Blue Team",
+    y = "Blue Team XP Differential at 10 Minutes",
+    fill = "Outcome"
+  ) +
+  theme(legend.position = "none")
+```
+
+This shows a similar pattern for experience differential. Blue-team wins tend to have more positive XP values at 10 minutes, which suggests that early XP leads are also related to final victory.
+
+## Early Dragon Control
+
+```{r dragon-summary-table, message=FALSE, warning=FALSE}
+dragon_summary <- riot_data %>%
+  group_by(blue_dragon_status) %>%
+  summarize(
+    matches = n(),
+    blue_wins = sum(blue_win == "Win"),
+    blue_losses = sum(blue_win == "Loss"),
+    win_rate = mean(blue_win == "Win"),
+    .groups = "drop"
+  )
+
+dragon_summary %>%
+  mutate(win_rate = percent(win_rate, accuracy = 0.1)) %>%
+  knitr::kable(caption = "Blue-team win rate by early dragon status.")
+```
+
+```{r, fig.width=8, fig.height=5}
+dragon_summary %>%
+  ggplot(aes(x = blue_dragon_status, y = win_rate, fill = blue_dragon_status)) +
+  geom_col(width = 0.6, alpha = 0.9) +
+  geom_text(
+    aes(label = paste0(percent(win_rate, accuracy = 1), "\n", "n = ", matches)),
+    vjust = -0.4,
+    fontface = "bold",
+    size = 4
+  ) +
+  scale_y_continuous(
+    labels = percent_format(accuracy = 1),
+    limits = c(0, 1),
+    breaks = seq(0, 1, by = 0.25)
+  ) +
+  labs(
+    title = "Blue Dragon Control Before 10 Minutes vs. Match Outcome",
+    subtitle = "Bars show the blue team's win rate with and without an early dragon",
+    x = "Blue Team Early Dragon Status",
+    y = "Blue Team Win Rate",
+    fill = "Dragon Status"
+  ) +
+  theme(legend.position = "none")
+```
+
+This directly compares win rates for matches where the blue team did or did not secure an early dragon. Showing win rate rather than a stacked proportion makes the dragon result easier to interpret.
+
+## Correlation Heatmap
+
+```{r, fig.width=8, fig.height=5}
+cor_long <- riot_data %>%
+  select(gold_diff_10m, xp_diff_10m, blue_dragon_10m, blue_win_num) %>%
+  cor() %>%
+  as_tibble(rownames = "feature_1") %>%
+  pivot_longer(-feature_1, names_to = "feature_2", values_to = "correlation") %>%
+  mutate(
+    feature_1 = recode(
+      feature_1,
+      gold_diff_10m = "Gold Diff 10m",
+      xp_diff_10m = "XP Diff 10m",
+      blue_dragon_10m = "Blue Dragon 10m",
+      blue_win_num = "Blue Win"
+    ),
+    feature_2 = recode(
+      feature_2,
+      gold_diff_10m = "Gold Diff 10m",
+      xp_diff_10m = "XP Diff 10m",
+      blue_dragon_10m = "Blue Dragon 10m",
+      blue_win_num = "Blue Win"
+    )
+  )
+
+cor_long %>%
+  ggplot(aes(x = feature_1, y = feature_2, fill = correlation)) +
+  geom_tile() +
+  geom_text(aes(label = round(correlation, 2)), size = 4) +
+  coord_equal() +
+  labs(
+    title = "Correlation Heatmap",
+    subtitle = "Gold, XP, dragon control, and final blue-team outcome",
+    x = NULL,
+    y = NULL,
+    fill = "Correlation"
+  )
+```
+
+The EDA shows that gold differential, XP differential, and early dragon control are all useful for understanding match outcomes. Gold and XP are continuous indicators of early-game lead, while the dragon variable adds an objective-control signal.
+
+# Statistical Modeling
+
+A logistic regression model was used because the outcome has two categories: blue-team win and blue-team loss. Logistic regression is a good fit for this project because it is easy to interpret and works well for a basic classification task.
+
+Two models were compared:
+
+1. **Gold + XP only**
+2. **Gold + XP + early dragon control**
+
+Comparing these models helps show whether early dragon control adds predictive value beyond gold and XP.
+
+```{r train-test-split, message=FALSE, warning=FALSE}
+riot_split <- initial_split(riot_data, prop = 0.75, strata = blue_win)
+riot_train <- training(riot_split)
+riot_test <- testing(riot_split)
+```
+
+```{r}
+old_recipe <- recipe(
+  blue_win ~ gold_diff_10m + xp_diff_10m,
+  data = riot_train
+) %>%
+  step_normalize(all_numeric_predictors())
+
+new_recipe <- recipe(
+  blue_win ~ gold_diff_10m + xp_diff_10m + blue_dragon_10m,
+  data = riot_train
+) %>%
+  step_normalize(all_numeric_predictors())
+
+logistic_model <- logistic_reg(mode = "classification") %>%
+  set_engine("glm")
+
+old_workflow <- workflow() %>%
+  add_recipe(old_recipe) %>%
+  add_model(logistic_model)
+
+new_workflow <- workflow() %>%
+  add_recipe(new_recipe) %>%
+  add_model(logistic_model)
+
+old_fit <- fit(old_workflow, data = riot_train)
+new_fit <- fit(new_workflow, data = riot_train)
+```
+
+
+## Model Performance
+
+```{r}
+get_model_results <- function(fit_object, test_data, model_name) {
+  test_data %>%
+    bind_cols(predict(fit_object, test_data, type = "class")) %>%
+    bind_cols(predict(fit_object, test_data, type = "prob")) %>%
+    mutate(model = model_name)
+}
+
+old_results <- get_model_results(old_fit, riot_test, "Gold + XP Only")
+new_results <- get_model_results(new_fit, riot_test, "Gold + XP + Dragon")
+
+get_metrics <- function(results_data) {
+  bind_rows(
+    accuracy(results_data, truth = blue_win, estimate = .pred_class),
+    roc_auc(results_data, truth = blue_win, .pred_Win, event_level = "second"),
+    sens(results_data, truth = blue_win, estimate = .pred_class, event_level = "second"),
+    spec(results_data, truth = blue_win, estimate = .pred_class, event_level = "second")
+  )
+}
+
+model_metrics <- bind_rows(
+  get_metrics(old_results) %>% mutate(model = "Gold + XP Only"),
+  get_metrics(new_results) %>% mutate(model = "Gold + XP + Dragon")
+) %>%
+  select(model, .metric, .estimate) %>%
+  pivot_wider(names_from = .metric, values_from = .estimate) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3)))
+
+model_metrics %>%
+  knitr::kable(caption = "Model performance comparison.")
+```
+
+The model achieved an accuracy of 0.715 and an ROC-AUC of 0.789 on the test set. Compared with the Gold + XP only model, adding early dragon control slightly improved accuracy from 0.703 to 0.715, while ROC-AUC stayed almost the same.
+
+## ROC Curve
+
+```{r}
+roc_data <- roc_curve(new_results, truth = blue_win, .pred_Win, event_level = "second")
+
+roc_data %>%
+  ggplot(aes(x = 1 - specificity, y = sensitivity)) +
+  geom_path(linewidth = 1) +
+  geom_abline(linetype = "dashed") +
+  coord_equal() +
+  labs(
+    title = "ROC Curve Logistic Regression Model",
+    subtitle = "Predictors: gold differential, XP differential, and early dragon control",
+    x = "False Positive Rate",
+    y = "True Positive Rate"
+  )
+```
+
+The ROC curve shows the model's tradeoff between correctly identifying wins and incorrectly labeling losses as wins. A curve farther above the diagonal line indicates stronger classification performance.
+
+## Confusion Matrix
+
+```{r}
+confusion_mat <- conf_mat(
+  new_results,
+  truth = blue_win,
+  estimate = .pred_class
+)
+
+confusion_tbl <- as.data.frame(confusion_mat$table) %>%
+  as_tibble() %>%
+  rename(n = Freq)
+
+confusion_tbl %>%
+  ggplot(aes(x = Prediction, y = Truth, fill = n)) +
+  geom_tile(alpha = 0.9) +
+  geom_text(aes(label = n), size = 6, fontface = "bold") +
+  labs(
+    title = "Confusion Matrix for Model",
+    subtitle = "Predicted match outcome compared with actual match outcome",
+    x = "Predicted Outcome",
+    y = "Actual Outcome",
+    fill = "Matches"
+  ) +
+  theme_minimal()
+```
+
+The confusion matrix shows where the model was correct and where it made mistakes. The mistakes are important because they show that early-game data cannot fully explain the final result. Some teams lose after strong starts, while others win after falling behind.
+
+```{r}
+feature_importance <- tidy(extract_fit_parsnip(new_fit)$fit) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(
+    importance = abs(estimate),
+    term = recode(
+      term,
+      gold_diff_10m = "Gold Differential at 10 Minutes",
+      xp_diff_10m = "XP Differential at 10 Minutes",
+      blue_dragon_10m = "Blue Dragon Before 10 Minutes"
+    ),
+    direction = if_else(
+      estimate >= 0,
+      "Increases predicted blue-team win probability",
+      "Decreases predicted blue-team win probability"
+    )
+  )
+
+feature_importance %>%
+  ggplot(aes(x = reorder(term, importance), y = estimate, fill = direction)) +
+  geom_col(alpha = 0.9) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  coord_flip() +
+  labs(
+    title = "Feature Importance from Logistic Regression",
+    subtitle = "Larger absolute coefficient values indicate stronger influence on prediction",
+    x = "Feature",
+    y = "Standardized Logistic Regression Coefficient",
+    fill = "Direction"
+  )
+```
+
+
+# Results
+
+The EDA and model results show that early-game advantages are meaningful signals for final match outcomes. Blue-team wins usually had higher gold and XP differentials at 10 minutes. Blue teams that secured an early dragon also had a higher win rate.
+
+The most important predictor appears to be **gold differential at 10 minutes**. This makes sense because gold directly affects item purchases, which can immediately increase a team's fighting power. XP differential and dragon control also matter, but gold has the clearest relationship with the final result.
+
+The logistic regression model provides a useful early prediction of the final outcome, but it does not perfectly predict every match. This is expected because League of Legends includes many unpredictable events after 10 minutes, including team fights, Baron lost, champions counter, and player mistakes.
+
+
+# Limitations 
+
+This analysis has several limitations. First, the sample focuses on Korean Master tier ranked
+solo queue, so the results may not apply to every rank, region, or patch. High-level players
+may snowball leads differently than lower-ranked players, and the value of early objectives can
+change across game updates.
+
+Second, the model only uses a small set of features. Gold differential, XP differential, and
+early dragon control are useful, but they do not include champion matchups, team composition,
+player roles, kills, deaths, assists, vision score, turret plates, Baron control, or late-game decision making. The dragon variable also only records whether the blue team secured a dragon before 10 minutes. It does not include dragon type or whether the red team secured other objectives.
+
+Finally, the model shows association, not direct causation. A team with a gold lead is more
+likely to win, but the gold lead itself is also the result of earlier plays, lane pressure, kills,farming, and objective control. The model should be read as a prediction tool, not proof that one single early-game event causes a win
+
+# Conclusion
+Overall, by using the Riot Games Developer API for automated data collection, we found that early-game features play a vital role in predicting match outcomes. Our EDA indicates that by the 10-minute mark, significant differentials in gold and experience between the red and blue teams are strongly correlated with the final result of the game. Although *League of Legends* is a complex game with numerous late-game turnaround mechanics, our preliminary findings suggest that, particularly in high-tier divisions, the "snowball effect" is significant. This implies that early-game advantages are very likely to/largely dictate the trajectory of the match. 
+
+Nevertheless, this model still has a lot of room for improvement. If we continue the work, the scope of predictors could be expanded to encompass features beyond simple wealth and experience. For instance, we can consider factors such as the champions' tiers, specific objective controls (e.g., the first Dragon), or individual vision scores. We believe that adding these additional variables would significantly increase the model's classification accuracy.
