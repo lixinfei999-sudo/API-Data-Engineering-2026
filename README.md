@@ -1,2 +1,2 @@
-# API-Data-Engineering-2026
-Building an Early-Game Win Predictor Using Riot API Match Timelines
+# Building an Early-Game Win Predictor Using Riot API Match Timelines
+This project uses early‑game performance metrics to predict match outcomes in League of Legends. Using 2,630 Master‑tier Ranked Solo/Duo matches collected through the Riot Games Developer API, the analysis evaluates whether gold differential, XP differential, and early dragon control at the 10‑minute mark can reliably forecast the final winner. A logistic regression classifier built with tidymodels achieves 0.789 ROC AUC, demonstrating that early‑game advantages provide strong—but not deterministic—signals of match trajectory.
